@@ -1,0 +1,68 @@
+{
+  "name": "agent-framework",
+  "version": "0.1.0",
+  "description": "A multi-agent framework for building AI agent systems with TypeScript",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    },
+    "./runtime/*": {
+      "import": "./dist/runtime/*.js",
+      "types": "./dist/runtime/*.d.ts"
+    },
+    "./core/*": {
+      "import": "./dist/core/*.js",
+      "types": "./dist/core/*.d.ts"
+    },
+    "./orchestrator": {
+      "import": "./dist/orchestrator/index.js",
+      "types": "./dist/orchestrator/index.d.ts"
+    },
+    "./mcp": {
+      "import": "./dist/mcp/index.js",
+      "types": "./dist/mcp/index.d.ts"
+    },
+    "./api": {
+      "import": "./dist/api.js",
+      "types": "./dist/api.d.ts"
+    }
+  },
+  "files": [
+    "dist",
+    "!dist/**/*.test.*",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx watch src/index.ts",
+    "test": "tsx --test src/**/*.test.ts",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "agent",
+    "multi-agent",
+    "ai",
+    "llm",
+    "framework",
+    "orchestration",
+    "typescript",
+    "mcp",
+    "tool-use",
+    "agent-loop"
+  ],
+  "license": "MIT",
+  "sideEffects": false,
+  "devDependencies": {
+    "@types/node": "^25.9.1",
+    "tsx": "^4.16.0",
+    "typescript": "^5.5.0"
+  }
+}
