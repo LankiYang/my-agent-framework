@@ -24,41 +24,63 @@ npm install
 ### 30 秒上手
 
 ```typescript
-import { createTool, createAgent, createApp } from './src/index.js'
+import { createModel, createTool, createAgent, createApp } from './src/index.js'
+
+// 接入模型（读取环境变量 ANTHROPIC_API_KEY / 或 ANTHROPIC_AUTH_TOKEN + ANTHROPIC_BASE_URL）
+const claude = createModel('claude', { model: 'claude-sonnet-4-20250514' })
 
 // 定义工具
 const echo = createTool('echo', '回显输入', async ({ text }) => text)
 
-// 定义 Agent
+// 定义 Agent —— model 为必填
 const assistant = createAgent({
   name: '助手',
+  model: claude,          // ← 必填：传 provider 实例（或已注册的模型 id 字符串）
   prompt: '你是一个 AI 助手',
   tools: [echo],
 })
 
-// 启动
+// 启动（createApp 会自动收集 agents 携带的 model provider）
 const app = createApp({ agents: [assistant] })
 await app.chat('你好')
 ```
 
+> ⚠️ **必读**：`createAgent` 的 `model` 是必填项。省略会在运行时报 “Model Provider 未注册”。
+> 传入 provider 实例（`createModel(...)` 的返回值）时，`createApp` 会自动注册它；
+> 若传字符串 id，则需自行 `framework.useModel(provider)` 或在 `createApp({ model })` 注册。
+
 ### 多 Agent 编排
 
 ```typescript
-import { createAgent, pipe, parallel } from './src/index.js'
+import { createModel, createAgent, pipe, parallel } from './src/index.js'
 
-const coder = createAgent({ name: 'Coder', prompt: '编写代码' })
-const reviewer = createAgent({ name: 'Reviewer', prompt: '审查代码' })
-const tester = createAgent({ name: 'Tester', prompt: '编写测试' })
+const claude = createModel('claude', {})
+
+const coder = createAgent({ name: 'Coder', model: claude, prompt: '编写代码' })
+const reviewer = createAgent({ name: 'Reviewer', model: claude, prompt: '审查代码' })
+const tester = createAgent({ name: 'Tester', model: claude, prompt: '编写测试' })
 
 // 流水线：Coder → Reviewer → Tester
 const pipeline = pipe(coder, reviewer, tester)
 const result = await pipeline.run('实现一个排序算法')
 
 // 并行：多角度分析
-const security = createAgent({ name: 'Security', prompt: '安全分析' })
-const perf = createAgent({ name: 'Perf', prompt: '性能分析' })
+const security = createAgent({ name: 'Security', model: claude, prompt: '安全分析' })
+const perf = createAgent({ name: 'Perf', model: claude, prompt: '性能分析' })
 const analysis = parallel(security, perf)
 const report = await analysis.run('分析这段代码')
+
+// 嵌套编排：并行子流程作为一个单元接入主流水线
+const nested = pipe(coder, parallel(security, perf).asAgent('并行审查'), reviewer)
+
+// Agent 当工具：让一个 Agent 把另一个 Agent 当子例程调用
+import { agentAsTool } from './src/index.js'
+const writer = createAgent({
+  name: 'Writer',
+  model: claude,
+  prompt: '写文章；需要资料时调用 ask_researcher 工具',
+  tools: [agentAsTool(coder, { description: '把子任务委派给编码 Agent' })],
+})
 ```
 
 ### 自定义工具
