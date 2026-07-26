@@ -40,7 +40,10 @@ export abstract class BaseOrchestrator {
     this.agents = def.agents;
   }
 
-  /** 注入 Agent 执行函数（由 Framework 提供，内部调用 agentLoop） */
+  /**
+   * @deprecated 并发不安全（实例字段会被并发 run 覆盖）。
+   * 请改用 run({ executor }) 按次传入执行器。此方法仅作兼容回退保留。
+   */
   setAgentExecutor(fn: AgentExecutorFn): void {
     this.agentExecutorFn = fn;
   }
@@ -73,15 +76,24 @@ export abstract class BaseOrchestrator {
     console.log(`[Orchestrator:${this.id}] ${message}`, ...args);
   }
 
-  /** 执行单个 Agent（优先使用注入的执行函数，否则回退到 echo） */
-  protected async executeAgent(agent: AgentDef, input: string, context: AgentContext): Promise<AgentResult> {
+  /**
+   * 执行单个 Agent。
+   * executor 解析优先级：per-run 传入的 executor（并发安全）> 实例注入的 agentExecutorFn（兼容）> echo 桩。
+   */
+  protected async executeAgent(
+    agent: AgentDef,
+    input: string,
+    context: AgentContext,
+    executor?: AgentExecutorFn,
+  ): Promise<AgentResult> {
     this.emit("agent:start", { agentId: agent.id, agentName: agent.name });
 
     try {
       let result: AgentResult;
 
-      if (this.agentExecutorFn) {
-        result = await this.agentExecutorFn(agent, input, context);
+      const fn = executor ?? this.agentExecutorFn;
+      if (fn) {
+        result = await fn(agent, input, context);
       } else {
         const messages: Message[] = [
           ...context.messages,
@@ -139,7 +151,7 @@ export class SequentialOrchestrator extends BaseOrchestrator {
         abortSignal: options.abortSignal,
       };
 
-      const result = await this.executeAgent(agent, currentInput, context);
+      const result = await this.executeAgent(agent, currentInput, context, options.executor);
       agentResults.push(result);
 
       // 将当前 Agent 的输出作为下一个 Agent 的输入
@@ -181,7 +193,7 @@ export class ParallelOrchestrator extends BaseOrchestrator {
         metadata: { ...options.context },
         abortSignal: options.abortSignal,
       };
-      return this.executeAgent(agent, options.input, context);
+      return this.executeAgent(agent, options.input, context, options.executor);
     });
 
     const results = await Promise.allSettled(tasks);
@@ -255,7 +267,7 @@ export class RouterOrchestrator extends BaseOrchestrator {
         abortSignal: options.abortSignal,
       };
 
-      const result = await this.executeAgent(agent, options.input, context);
+      const result = await this.executeAgent(agent, options.input, context, options.executor);
       agentResults.push(result);
     }
 
@@ -312,7 +324,7 @@ export class SupervisorOrchestrator extends BaseOrchestrator {
       abortSignal: options.abortSignal,
     };
 
-    const plan = await this.executeAgent(this.supervisor, options.input, supervisorContext);
+    const plan = await this.executeAgent(this.supervisor, options.input, supervisorContext, options.executor);
 
     // 第二步：解析 supervisor 的分配计划并执行
     let assignments: Array<{ agentId: string; task: string }>;
@@ -343,7 +355,7 @@ export class SupervisorOrchestrator extends BaseOrchestrator {
         abortSignal: options.abortSignal,
       };
 
-      const result = await this.executeAgent(targetAgent, assignment.task, workerContext);
+      const result = await this.executeAgent(targetAgent, assignment.task, workerContext, options.executor);
       agentResults.push(result);
     }
 

@@ -36,6 +36,16 @@ export interface PermissionContext {
   toolName: string;
   input: ToolInput;
   metadata: Record<string, unknown>;
+  /** 请求者用户 ID（身份感知权限用；可选） */
+  userId?: string;
+  /** 请求者角色（如 admin/member/guest；可选） */
+  role?: string;
+}
+
+/** 请求者身份，贯穿权限判定 */
+export interface RequesterIdentity {
+  userId?: string;
+  role?: string;
 }
 
 /** 权限规则定义 */
@@ -212,6 +222,7 @@ export class PermissionEngine {
     tools: ToolDef[],
     mode: PermissionMode,
     extraMetadata: Record<string, unknown> = {},
+    identity: RequesterIdentity = {},
   ): PermissionLevel {
     const toolDef = tools.find((t) => t.name === toolName);
 
@@ -219,6 +230,8 @@ export class PermissionEngine {
       mode,
       toolName,
       input,
+      userId: identity.userId,
+      role: identity.role,
       metadata: {
         ...extraMetadata,
         toolDef,
@@ -226,6 +239,36 @@ export class PermissionEngine {
     };
 
     return this.evaluate(ctx);
+  }
+
+  /**
+   * 便捷规则：拒绝指定用户使用指定工具（黑名单）。
+   * 优先级 -10（高于内置规则），确保先于 allow/ask 生效。
+   */
+  denyToolForUser(toolName: string, userId: string): void {
+    this.addRule({
+      name: `deny:${userId}:${toolName}`,
+      priority: -10,
+      description: `拒绝用户 ${userId} 使用工具 ${toolName}`,
+      evaluate: (ctx) =>
+        ctx.toolName === toolName && ctx.userId === userId ? PermissionLevel.Denied : null,
+    });
+  }
+
+  /**
+   * 便捷规则：只允许指定角色使用指定工具（其他角色一律拒绝该工具）。
+   * 优先级 -10。适合"仅 admin 能用 bash"这类场景。
+   */
+  restrictToolToRole(toolName: string, allowedRole: string): void {
+    this.addRule({
+      name: `restrict:${toolName}:${allowedRole}`,
+      priority: -10,
+      description: `工具 ${toolName} 仅限角色 ${allowedRole}`,
+      evaluate: (ctx) => {
+        if (ctx.toolName !== toolName) return null;
+        return ctx.role === allowedRole ? null : PermissionLevel.Denied;
+      },
+    });
   }
 
   /** 获取当前所有规则（按优先级排列） */

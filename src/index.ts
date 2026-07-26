@@ -35,6 +35,7 @@ import type { AgentLoopTerminal, AgentLoopEvent } from "./runtime/agent-loop.js"
 import { PermissionEngine, PermissionMode } from "./runtime/permission.js";
 import { HookRegistry, HookPoint } from "./runtime/middleware.js";
 import type { MiddlewareFn } from "./runtime/middleware.js";
+import { SessionManager } from "./runtime/session-manager.js";
 
 /** 把 AgentDef.permissionMode 字符串解析为 PermissionMode 枚举，无效值回退 Default */
 function resolvePermissionMode(mode: string | undefined): PermissionMode {
@@ -62,11 +63,31 @@ export class Framework {
   private running = false;
   /** 默认执行环境，注入内置工具的 SharedContext.env */
   private defaultEnv: unknown;
+  /** 会话管理器：per-session 隔离的消息历史，支撑多用户/多会话 */
+  private sessionManager: SessionManager = new SessionManager();
+  /** 共享权限引擎：用户在此配置身份感知规则（denyToolForUser 等），跨 run 生效 */
+  private permissionEngine: PermissionEngine = new PermissionEngine();
+
+  /** 访问权限引擎，配置身份感知的工具权限规则 */
+  get permissions(): PermissionEngine {
+    return this.permissionEngine;
+  }
 
   /** 设置默认执行环境（ExecutionEnv），内置 read/write/bash 工具会用它访问系统 */
   useEnv(env: unknown): this {
     this.defaultEnv = env;
     return this;
+  }
+
+  /** 为会话历史启用持久化后端（跨进程恢复）。传入一个 StorageProvider */
+  useSessionStorage(provider: StorageProvider): this {
+    this.sessionManager = new SessionManager({ storage: provider });
+    return this;
+  }
+
+  /** 访问会话管理器（列出/删除/查询会话） */
+  get sessions(): SessionManager {
+    return this.sessionManager;
   }
 
   /** 注册 Agent */
@@ -265,6 +286,7 @@ export class Framework {
     agent: AgentDef,
     input: string,
     options?: FrameworkRunOptions,
+    historyMessages: Message[] = [],
   ): { initialMessages: Message[]; loopOptions: Parameters<typeof agentLoop>[1] } {
     // 1. 解析模型提供者
     // 1. 解析模型提供者：优先 agent 自带的 modelProvider 实例，否则按 id 查注册表
@@ -298,12 +320,14 @@ export class Framework {
       content: input,
       timestamp: Date.now(),
     };
+    // 会话历史（若有）作为前缀，实现多轮对话
     const initialMessages: Message[] = [
+      ...historyMessages,
       userMessage,
     ];
 
-    // 4. 创建权限引擎
-    const permissionEngine = new PermissionEngine();
+    // 4. 权限引擎：使用框架共享实例，使用户配置的身份感知规则跨 run 生效
+    const permissionEngine = this.permissionEngine;
 
     // 4b. 解析 Agent 的权限模式（字符串 → 枚举，无效值回退 Default）
     const permissionMode = resolvePermissionMode(agent.permissionMode);
@@ -335,6 +359,7 @@ export class Framework {
       hooks,
       compaction: agent.contextBudget ? { budget: agent.contextBudget } : undefined,
       env: this.defaultEnv,
+      identity: options?.userId ? { userId: options.userId, role: options?.role } : undefined,
     };
 
     return { initialMessages, loopOptions };
@@ -350,14 +375,24 @@ export class Framework {
     input: string,
     options?: FrameworkRunOptions,
   ): AsyncGenerator<AgentLoopEvent, AgentLoopTerminal> {
-    const { initialMessages, loopOptions } = this.prepareAgentLoop(agent, input, options);
+    // 有 sessionId 时载入该会话历史作为上下文前缀（多轮/多用户隔离）
+    const sessionId = options?.sessionId;
+    const history = sessionId ? await this.sessionManager.getMessages(sessionId) : [];
+
+    const { initialMessages, loopOptions } = this.prepareAgentLoop(agent, input, options, history);
     const gen = agentLoop(initialMessages, loopOptions);
     let next = await gen.next();
     while (!next.done) {
       yield next.value;
       next = await gen.next();
     }
-    return next.value;
+    const terminal = next.value;
+
+    // 回存：把本轮完整历史写回该会话，供下次续接
+    if (sessionId) {
+      await this.sessionManager.replaceMessages(sessionId, terminal.messages, options?.userId);
+    }
+    return terminal;
   }
 
   /**
@@ -407,15 +442,12 @@ export class Framework {
         throw new Error(`编排器 "${options.orchestrator}" 未注册`);
       }
 
-      // 注入 agentLoop 执行函数，让编排器内部调用 agentLoop
-      orchestrator.setAgentExecutor(
-        (agent, agentInput, _ctx) => this.executeAgentLoop(agent, agentInput, options),
-      );
-
+      // per-run 传入 agentLoop 执行器（并发安全，不再覆盖实例字段）
       const result = await orchestrator.run({
         input,
         context: options.context,
         abortSignal: options.abortSignal,
+        executor: (agent, agentInput, _ctx) => this.executeAgentLoop(agent, agentInput, options),
       });
 
       return {
@@ -624,6 +656,11 @@ export {
   PermissionMode,
   PermissionLevel,
 } from "./runtime/permission.js";
+export type {
+  PermissionContext,
+  PermissionRule,
+  RequesterIdentity,
+} from "./runtime/permission.js";
 
 export {
   ToolExecutor,
@@ -663,6 +700,9 @@ export {
   formatSkillsForPrompt,
 } from "./runtime/skills.js";
 export type { Skill } from "./runtime/skills.js";
+
+export { SessionManager } from "./runtime/session-manager.js";
+export type { SessionManagerOptions } from "./runtime/session-manager.js";
 
 export {
   BaseOrchestrator,

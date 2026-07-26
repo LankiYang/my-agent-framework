@@ -95,3 +95,46 @@ test("removeRule 可移除内置规则", () => {
   const level = engine.checkToolPermission("write", {}, tools, PermissionMode.Default);
   assert.equal(level, PermissionLevel.Ask);
 });
+
+test("S1: denyToolForUser 只拒绝指定用户，其他用户不受影响", () => {
+  const engine = new PermissionEngine();
+  engine.denyToolForUser("write", "bob");
+
+  // bob 用 write → 拒绝
+  const bob = engine.checkToolPermission("write", {}, tools, PermissionMode.Bypass, {}, { userId: "bob" });
+  assert.equal(bob, PermissionLevel.Denied);
+
+  // alice 用 write → 不受该规则影响（Bypass 下放行）
+  const alice = engine.checkToolPermission("write", {}, tools, PermissionMode.Bypass, {}, { userId: "alice" });
+  assert.equal(alice, PermissionLevel.Allowed);
+
+  // bob 用 read（非目标工具）→ 不受影响
+  const bobRead = engine.checkToolPermission("read", {}, tools, PermissionMode.Bypass, {}, { userId: "bob" });
+  assert.equal(bobRead, PermissionLevel.Allowed);
+});
+
+test("S1: restrictToolToRole 仅允许指定角色", () => {
+  const engine = new PermissionEngine();
+  engine.restrictToolToRole("write", "admin");
+
+  const admin = engine.checkToolPermission("write", {}, tools, PermissionMode.Bypass, {}, { role: "admin" });
+  assert.equal(admin, PermissionLevel.Allowed);
+
+  const member = engine.checkToolPermission("write", {}, tools, PermissionMode.Bypass, {}, { role: "member" });
+  assert.equal(member, PermissionLevel.Denied);
+});
+
+test("S1: 身份出现在 PermissionContext 供自定义规则使用", () => {
+  const engine = new PermissionEngine();
+  let seenUserId: string | undefined;
+  engine.addRule({
+    name: "capture",
+    priority: -20,
+    evaluate: (ctx) => {
+      seenUserId = ctx.userId;
+      return null;
+    },
+  });
+  engine.checkToolPermission("read", {}, tools, PermissionMode.Bypass, {}, { userId: "carol" });
+  assert.equal(seenUserId, "carol");
+});

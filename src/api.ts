@@ -250,10 +250,10 @@ export interface OrchestrateConfig {
 export interface App {
   /** 内部 Framework 实例 */
   framework: Framework;
-  /** 运行单次对话；可选 options.agent 指定运行哪个 Agent（id 或 name） */
-  chat(input: string, options?: { agent?: string }): Promise<AgentResult>;
-  /** 流式运行单次对话：yield agentLoop 事件（内容增量、工具执行等），实时进度 */
-  chatStream(input: string, options?: { agent?: string }): AsyncGenerator<AgentLoopEvent, AgentLoopTerminal>;
+  /** 运行单次对话；options 可指定 agent、sessionId（多轮会话）、userId */
+  chat(input: string, options?: { agent?: string; sessionId?: string; userId?: string }): Promise<AgentResult>;
+  /** 流式运行单次对话：yield agentLoop 事件；options 同 chat */
+  chatStream(input: string, options?: { agent?: string; sessionId?: string; userId?: string }): AsyncGenerator<AgentLoopEvent, AgentLoopTerminal>;
   /** 监听渠道 */
   listen(config: ListenConfig): Promise<void>;
   /** 编排多 Agent */
@@ -327,18 +327,18 @@ export function createApp(config: AppConfig): App {
   const app: App = {
     framework,
 
-    async chat(input: string, options?: { agent?: string }): Promise<AgentResult> {
+    async chat(input: string, options?: { agent?: string; sessionId?: string; userId?: string }): Promise<AgentResult> {
       if (!framework.isRunning) {
         await framework.start();
       }
-      return framework.run(input, options?.agent ? { agent: options.agent } : undefined);
+      return framework.run(input, options);
     },
 
-    async *chatStream(input: string, options?: { agent?: string }) {
+    async *chatStream(input: string, options?: { agent?: string; sessionId?: string; userId?: string }) {
       if (!framework.isRunning) {
         await framework.start();
       }
-      return yield* framework.runStream(input, options?.agent ? { agent: options.agent } : undefined);
+      return yield* framework.runStream(input, options);
     },
 
     async listen(_config: ListenConfig): Promise<void> {
@@ -387,14 +387,11 @@ export function createApp(config: AppConfig): App {
         },
       });
 
-      // 注入真实执行器：用 app 自身的 framework 驱动 agentLoop（agents 已注册其中）
-      orchestrator.setAgentExecutor((agent, agentInput) =>
-        framework.run(agentInput, { agent: agent.id }),
-      );
-
+      // per-run 传入真实执行器：用 app 自身的 framework 驱动 agentLoop（并发安全）
       return orchestrator.run({
         input: orchestrateConfig.input,
         context: orchestrateConfig.context,
+        executor: (agent, agentInput) => framework.run(agentInput, { agent: agent.id }),
       });
     },
   };
@@ -724,9 +721,12 @@ export function pipe(...agents: AgentDef[]): Pipeline {
         },
       });
       const { executor, framework } = await buildFrameworkExecutor(agents);
-      orchestrator.setAgentExecutor((agent, agentInput) => executor(agent, agentInput));
       try {
-        return await orchestrator.run({ input, context });
+        return await orchestrator.run({
+          input,
+          context,
+          executor: (agent, agentInput) => executor(agent, agentInput),
+        });
       } finally {
         await framework.stop(); // 清理内部临时 Framework，避免资源泄漏
       }
@@ -760,9 +760,12 @@ export function parallel(...agents: AgentDef[]): Pipeline {
         },
       });
       const { executor, framework } = await buildFrameworkExecutor(agents);
-      orchestrator.setAgentExecutor((agent, agentInput) => executor(agent, agentInput));
       try {
-        return await orchestrator.run({ input, context });
+        return await orchestrator.run({
+          input,
+          context,
+          executor: (agent, agentInput) => executor(agent, agentInput),
+        });
       } finally {
         await framework.stop(); // 清理内部临时 Framework，避免资源泄漏
       }

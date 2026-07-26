@@ -310,6 +310,12 @@ export interface Session {
   systemPrompt?: string;
   /** 元数据 */
   metadata: Record<string, unknown>;
+  /** 所属用户 ID（多用户隔离用；可选） */
+  userId?: string;
+  /** 创建时间戳 */
+  createdAt?: number;
+  /** 最后更新时间戳 */
+  updatedAt?: number;
 }
 
 // ============================================================
@@ -450,6 +456,11 @@ export interface OrchestratorRunOptions {
   context?: Record<string, unknown>;
   /** 外部中止信号 */
   abortSignal?: AbortSignal;
+  /**
+   * 本次运行使用的 Agent 执行器。per-run 传入以保证并发安全：
+   * 多个并发 run 各带各的 executor，不再共享/覆盖实例字段。
+   */
+  executor?: (agent: AgentDef, input: string, context: AgentContext) => Promise<AgentResult>;
 }
 
 /** 编排器运行结果 */
@@ -475,6 +486,16 @@ export interface FrameworkRunOptions {
   orchestrator?: string;
   /** 指定要运行的 Agent（id 或 name）；未指定时使用第一个注册的 Agent */
   agent?: string;
+  /**
+   * 会话 ID：提供后，本次 run 会载入该会话的历史消息作为上下文前缀，
+   * 并把本轮新产生的消息追加回该会话，实现多轮对话与多用户隔离。
+   * 不提供则为无状态单次调用（与旧行为一致）。
+   */
+  sessionId?: string;
+  /** 用户 ID：创建会话时记录归属，用于身份感知的工具权限判定 */
+  userId?: string;
+  /** 请求者角色（如 admin/member）：用于基于角色的工具权限 */
+  role?: string;
   /** 指定模型名称 */
   model?: string;
   /** 上下文数据 */

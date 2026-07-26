@@ -14,6 +14,7 @@ import type {
   SharedContext,
 } from "../core/types.js";
 import { PermissionEngine, PermissionMode, PermissionLevel } from "./permission.js";
+import type { RequesterIdentity } from "./permission.js";
 
 // ============================================================
 // 错误类型
@@ -65,17 +66,20 @@ export class ToolExecutor {
   private readonly permissionEngine?: PermissionEngine;
   private readonly permissionMode: PermissionMode;
   private readonly askHandler?: (toolName: string, input: ToolInput) => Promise<boolean>;
+  private readonly identity: RequesterIdentity;
 
   constructor(
     tools: ToolDef[],
     permissionEngine?: PermissionEngine,
     permissionMode?: PermissionMode,
     askHandler?: (toolName: string, input: ToolInput) => Promise<boolean>,
+    identity?: RequesterIdentity,
   ) {
     this.toolMap = new Map(tools.map((t) => [t.name, t]));
     this.permissionEngine = permissionEngine;
     this.permissionMode = permissionMode ?? PermissionMode.Default;
     this.askHandler = askHandler;
+    this.identity = identity ?? {};
   }
 
   /** 获取所有已注册的工具定义 */
@@ -238,6 +242,8 @@ export class ToolExecutor {
         input,
         this.getAllTools(),
         this.permissionMode,
+        {},
+        this.identity,
       );
       if (level === PermissionLevel.Denied) {
         return `权限拒绝: 工具 "${toolDef.name}" 未被授权执行`;

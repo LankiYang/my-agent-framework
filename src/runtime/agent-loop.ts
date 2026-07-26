@@ -24,6 +24,7 @@ import { ContextManager, CHARS_PER_TOKEN } from "./context-manager.js";
 import { HookRegistry, HookPoint } from "./middleware.js";
 import type { MiddlewareContext } from "./middleware.js";
 import { PermissionEngine, PermissionMode } from "./permission.js";
+import type { RequesterIdentity } from "./permission.js";
 import { compactMessages } from "./compaction.js";
 
 // ============================================================
@@ -138,6 +139,8 @@ export interface AgentLoopOptions {
   };
   /** 执行环境，注入到工具的 SharedContext.env（内置 read/write/bash 工具会用） */
   env?: unknown;
+  /** 请求者身份（userId/role），用于身份感知的工具权限判定 */
+  identity?: RequesterIdentity;
 }
 
 // ============================================================
@@ -200,8 +203,8 @@ function delay(ms: number): Promise<void> {
  * 当用户未注入某项依赖时，使用框架内置的 ToolExecutor / ContextManager / HookRegistry
  */
 function buildDefaultDeps(options: AgentLoopOptions): AgentLoopDeps {
-  const { model, tools, hooks, permissionEngine, permissionMode, askHandler } = options;
-  const toolExecutor = new ToolExecutor(tools, permissionEngine, permissionMode, askHandler);
+  const { model, tools, hooks, permissionEngine, permissionMode, askHandler, identity } = options;
+  const toolExecutor = new ToolExecutor(tools, permissionEngine, permissionMode, askHandler, identity);
   const contextManager = new ContextManager();
   const hookRegistry = hooks ?? new HookRegistry();
 
@@ -694,20 +697,9 @@ export async function* agentLoop(
       };
     }
 
-    // 10g. 权限拒绝检查：如果所有工具都因权限被拒绝
-    const allPermissionDenied = toolResults.length > 0 && toolResults.every(
-      (r) => r.content.includes("权限拒绝"),
-    );
-    if (allPermissionDenied) {
-      const finalMsgs = [...state.messages, assistantMessage, ...pendingToolCalls, ...toolResults];
-      yield { type: "turn_end", reason: "permission_denied", turn: state.turnCount };
-      return {
-        reason: "permission_denied",
-        turnCount: state.turnCount,
-        messages: finalMsgs,
-        transition: state.transition,
-      };
-    }
+    // 10g. 权限拒绝：不再硬终止，而是把"权限拒绝"结果回传给模型（见第 11 步），
+    // 让模型据此向用户解释（例如"我没有执行该工具的权限"）后自然结束。
+    // maxTurns 作为防止反复重试同一被拒工具的最终护栏。
 
     // ----------------------------------------------------------
     // 11. 组装下一轮消息 — Continue Site: next_turn

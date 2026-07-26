@@ -99,3 +99,38 @@ test("Supervisor：解析 JSON 分派计划并执行 worker", async () => {
   assert.ok(record.some((r) => r.id === "w1" && r.input === "do-1"));
   assert.match(res.output, /w1-done/);
 });
+
+test("S2: per-run executor 并发隔离，不再互相覆盖", async () => {
+  // 同一个 orchestrator 实例，两个并发 run 各带不同 executor（带延迟制造交错）
+  const orch = new SequentialOrchestrator({
+    id: "shared",
+    agents: [agent("A")],
+    strategy: OrchestratorStrategy.Sequential,
+  });
+
+  const makeExecutor = (tag: string) =>
+    async (a: AgentDef, input: string): Promise<AgentResult> => {
+      await new Promise((r) => setTimeout(r, 20)); // 制造交错窗口
+      return { output: `${tag}:${input}`, messages: [], metadata: {} };
+    };
+
+  // 并发跑两个 run，各自的 executor 必须互不串
+  const [r1, r2] = await Promise.all([
+    orch.run({ input: "x", executor: makeExecutor("RUN1") }),
+    orch.run({ input: "y", executor: makeExecutor("RUN2") }),
+  ]);
+
+  assert.equal(r1.output, "RUN1:x");
+  assert.equal(r2.output, "RUN2:y");
+});
+
+test("S2: 无 executor 时回退到 echo 桩（向后兼容）", async () => {
+  const orch = new SequentialOrchestrator({
+    id: "noexec",
+    agents: [agent("A")],
+    strategy: OrchestratorStrategy.Sequential,
+  });
+  const res = await orch.run({ input: "hello" });
+  // echo 桩：output 即 input
+  assert.equal(res.output, "hello");
+});
