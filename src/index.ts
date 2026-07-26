@@ -31,8 +31,17 @@ import {
 import { MCPManager, createMCPManager } from "./mcp/manager.js";
 import type { MCPServerConfig } from "./mcp/types.js";
 import { agentLoop } from "./runtime/agent-loop.js";
-import type { AgentLoopTerminal } from "./runtime/agent-loop.js";
+import type { AgentLoopTerminal, AgentLoopEvent } from "./runtime/agent-loop.js";
 import { PermissionEngine, PermissionMode } from "./runtime/permission.js";
+import { HookRegistry, HookPoint } from "./runtime/middleware.js";
+import type { MiddlewareFn } from "./runtime/middleware.js";
+
+/** 把 AgentDef.permissionMode 字符串解析为 PermissionMode 枚举，无效值回退 Default */
+function resolvePermissionMode(mode: string | undefined): PermissionMode {
+  if (!mode) return PermissionMode.Default;
+  const values = Object.values(PermissionMode) as string[];
+  return values.includes(mode) ? (mode as PermissionMode) : PermissionMode.Default;
+}
 
 // ============ Framework 类 ============
 
@@ -51,6 +60,14 @@ export class Framework {
   private mcpManager: MCPManager | null = null;
   private listeners: Map<FrameworkEventType, Set<FrameworkEventListener>> = new Map();
   private running = false;
+  /** 默认执行环境，注入内置工具的 SharedContext.env */
+  private defaultEnv: unknown;
+
+  /** 设置默认执行环境（ExecutionEnv），内置 read/write/bash 工具会用它访问系统 */
+  useEnv(env: unknown): this {
+    this.defaultEnv = env;
+    return this;
+  }
 
   /** 注册 Agent */
   useAgent(def: AgentDef): this {
@@ -157,37 +174,49 @@ export class Framework {
     this.listeners.get(type)?.forEach((listener) => listener(event));
   }
 
-  /** 启动框架 */
+  /**
+   * 启动框架。
+   * - MCP 连接失败视为 optional：仅警告并通过 emit 通知，继续启动。
+   * - Workspace / Channel 初始化失败视为 critical：回滚 running 并抛错，
+   *   避免"标记为运行中但关键组件不可用"的隐蔽故障。
+   */
   async start(): Promise<void> {
     if (this.running) {
       throw new Error("框架已在运行中");
     }
     this.running = true;
 
-    // 连接所有 MCP 服务器
+    // 连接所有 MCP 服务器（optional：失败不阻断）
     if (this.mcpManager) {
       try {
         await this.mcpManager.connectAll();
       } catch (error) {
-        console.error("MCP 服务器连接失败:", error);
+        console.warn("[Framework] MCP 服务器连接失败（已跳过，其余功能不受影响）:", error);
+        this.emit("agent:error", { phase: "start", component: "mcp", error });
       }
     }
 
-    // 初始化所有工作空间
+    // 初始化所有工作空间（critical）
     for (const [name, ws] of this.workspaces) {
       try {
         await ws.initialize();
       } catch (error) {
-        console.error(`Workspace "${name}" 初始化失败:`, error);
+        this.running = false;
+        throw new Error(
+          `Workspace "${name}" 初始化失败，框架启动中止: ${(error as Error).message}`,
+        );
       }
     }
 
-    // 启动所有 Channel
+    // 启动所有 Channel（critical）
     for (const [id, channel] of this.channels) {
       try {
         await channel.start();
       } catch (error) {
-        console.error(`Channel "${id}" 启动失败:`, error);
+        this.running = false;
+        throw new Error(
+          `Channel "${id}" 启动失败，框架启动中止: ${(error as Error).message}`,
+        );
       }
     }
   }
@@ -229,18 +258,28 @@ export class Framework {
   }
 
   /**
-   * 通过 agentLoop 执行单个 Agent 的完整推理循环
-   * 解析模型提供者、收集工具、创建权限引擎，消费 AsyncGenerator 返回最终结果
+   * 准备单个 Agent 的 agentLoop 输入：解析模型、收集工具、装配权限与中间件。
+   * 供一次性执行与流式执行共用。
    */
-  private async executeAgentLoop(
+  private prepareAgentLoop(
     agent: AgentDef,
     input: string,
     options?: FrameworkRunOptions,
-  ): Promise<AgentResult> {
+  ): { initialMessages: Message[]; loopOptions: Parameters<typeof agentLoop>[1] } {
     // 1. 解析模型提供者
-    const model = this.models.get(agent.model);
+    // 1. 解析模型提供者：优先 agent 自带的 modelProvider 实例，否则按 id 查注册表
+    let model = agent.modelProvider ?? this.models.get(agent.model);
+    if (agent.modelProvider && !this.models.has(agent.modelProvider.id)) {
+      // agent 携带了 provider 实例但未注册，自动补注册，保证一致性
+      this.models.set(agent.modelProvider.id, agent.modelProvider);
+    }
     if (!model) {
-      throw new Error(`Model Provider "${agent.model}" 未注册（Agent "${agent.name}" 需要）`);
+      const registered = [...this.models.keys()];
+      throw new Error(
+        `Model Provider "${agent.model}" 未注册（Agent "${agent.name}" 需要）。\n` +
+          `已注册的 Model: [${registered.join(", ") || "无"}]。\n` +
+          `修复：framework.useModel(provider)，或在 createApp({ model }) / createAgent({ model: providerInstance }) 传入。`,
+      );
     }
 
     // 2. 收集工具（Agent 工具 + 框架全局工具，去重）
@@ -266,6 +305,23 @@ export class Framework {
     // 4. 创建权限引擎
     const permissionEngine = new PermissionEngine();
 
+    // 4b. 解析 Agent 的权限模式（字符串 → 枚举，无效值回退 Default）
+    const permissionMode = resolvePermissionMode(agent.permissionMode);
+
+    // 4c. 装配 Agent 中间件到 HookRegistry（按 hookPoint 注册，缺省 onReply）
+    let hooks: HookRegistry | undefined;
+    if (agent.middleware && agent.middleware.length > 0) {
+      hooks = new HookRegistry();
+      const validPoints = new Set(Object.values(HookPoint) as string[]);
+      for (const mw of agent.middleware) {
+        const point =
+          mw.hookPoint && validPoints.has(mw.hookPoint)
+            ? (mw.hookPoint as HookPoint)
+            : HookPoint.onReply;
+        hooks.register(point, mw.fn as MiddlewareFn);
+      }
+    }
+
     // 5. 构建 AgentLoopOptions
     const loopOptions = {
       model,
@@ -274,35 +330,66 @@ export class Framework {
       maxTurns: agent.maxTurns,
       abortSignal: options?.abortSignal,
       permissionEngine,
-      permissionMode: PermissionMode.Default,
+      permissionMode,
+      askHandler: options?.askHandler,
+      hooks,
+      compaction: agent.contextBudget ? { budget: agent.contextBudget } : undefined,
+      env: this.defaultEnv,
     };
 
-    // 6. 消费 AsyncGenerator（手动 .next() 迭代以捕获 terminal value）
+    return { initialMessages, loopOptions };
+  }
+
+  /**
+   * 流式执行单个 Agent：把 agentLoop 的事件逐个 yield 给调用方，
+   * 返回 AgentLoopTerminal 作为 generator 的 return 值。
+   * 这是对外流式 API（runStream / chatStream）的底层。
+   */
+  private async *streamAgentLoop(
+    agent: AgentDef,
+    input: string,
+    options?: FrameworkRunOptions,
+  ): AsyncGenerator<AgentLoopEvent, AgentLoopTerminal> {
+    const { initialMessages, loopOptions } = this.prepareAgentLoop(agent, input, options);
     const gen = agentLoop(initialMessages, loopOptions);
-    let terminal: AgentLoopTerminal;
-
-    while (true) {
-      const { value, done } = await gen.next();
-      if (done) {
-        terminal = value as AgentLoopTerminal;
-        break;
-      }
+    let next = await gen.next();
+    while (!next.done) {
+      yield next.value;
+      next = await gen.next();
     }
+    return next.value;
+  }
 
-    // 7. 从 terminal 消息中提取最后的 assistant 输出
-    const lastAssistant = [...terminal!.messages]
+  /**
+   * 通过 agentLoop 执行单个 Agent 的完整推理循环（一次性，返回最终结果）。
+   */
+  private async executeAgentLoop(
+    agent: AgentDef,
+    input: string,
+    options?: FrameworkRunOptions,
+  ): Promise<AgentResult> {
+    // 复用流式底层，消费到终止
+    const gen = this.streamAgentLoop(agent, input, options);
+    let next = await gen.next();
+    while (!next.done) {
+      next = await gen.next();
+    }
+    const terminal = next.value;
+
+    // 从 terminal 消息中提取最后的 assistant 输出
+    const lastAssistant = [...terminal.messages]
       .reverse()
       .find((m: Message) => m.role === "assistant");
     const output = lastAssistant?.content ?? input;
 
     return {
       output,
-      messages: terminal!.messages,
+      messages: terminal.messages,
       metadata: {
         agentId: agent.id,
         agentName: agent.name,
-        stopReason: terminal!.reason,
-        turnCount: terminal!.turnCount,
+        stopReason: terminal.reason,
+        turnCount: terminal.turnCount,
       },
     };
   }
@@ -346,20 +433,64 @@ export class Framework {
       };
     }
 
-    // 默认：使用第一个注册的 Agent，通过 agentLoop 执行完整推理
-    const firstAgent = this.agents.values().next().value;
-    if (!firstAgent) {
-      throw new Error("未注册任何 Agent");
-    }
+    // 默认：使用指定的 Agent（options.agent，按 id 或 name），否则第一个注册的 Agent
+    const targetAgent = this.selectAgent(options?.agent);
 
-    this.emit("agent:start", { agentId: firstAgent.id, agentName: firstAgent.name, input });
+    this.emit("agent:start", { agentId: targetAgent.id, agentName: targetAgent.name, input });
 
     try {
-      const result = await this.executeAgentLoop(firstAgent, input, options);
-      this.emit("agent:end", { agentId: firstAgent.id, output: result.output });
+      const result = await this.executeAgentLoop(targetAgent, input, options);
+      this.emit("agent:end", { agentId: targetAgent.id, output: result.output });
       return result;
     } catch (error) {
-      this.emit("agent:error", { agentId: firstAgent.id, error });
+      this.emit("agent:error", { agentId: targetAgent.id, error });
+      throw error;
+    }
+  }
+
+  /** 选择目标 Agent：给定 id/name 则解析，否则取第一个注册的；找不到抛富错误 */
+  private selectAgent(agentKey?: string): AgentDef {
+    if (agentKey) {
+      const found = this.resolveAgent(agentKey);
+      if (!found) {
+        throw new Error(
+          `未找到 Agent "${agentKey}"。已注册: [${this.listAgentLabels()}]。（agent 参数接受 id 或 name）`,
+        );
+      }
+      return found;
+    }
+    const first = this.agents.values().next().value;
+    if (!first) {
+      throw new Error("未注册任何 Agent，请先 framework.useAgent(agent) 或 createApp({ agents })");
+    }
+    return first;
+  }
+
+  /**
+   * 流式执行单次推理：yield agentLoop 的每个事件（内容增量、工具执行、恢复等），
+   * generator 结束时 return 最终 AgentLoopTerminal。
+   * 不支持 orchestrator（编排走 run）；用于需要实时进度的单 Agent 场景。
+   *
+   * @example
+   * for await (const ev of framework.runStream("你好")) {
+   *   if (ev.type === "content_delta") process.stdout.write(ev.delta);
+   * }
+   */
+  async *runStream(
+    input: string,
+    options?: FrameworkRunOptions,
+  ): AsyncGenerator<AgentLoopEvent, AgentLoopTerminal> {
+    if (!this.running) {
+      throw new Error("框架未启动，请先调用 start()");
+    }
+    const targetAgent = this.selectAgent(options?.agent);
+    this.emit("agent:start", { agentId: targetAgent.id, agentName: targetAgent.name, input });
+    try {
+      const terminal = yield* this.streamAgentLoop(targetAgent, input, options);
+      this.emit("agent:end", { agentId: targetAgent.id, output: "" });
+      return terminal;
+    } catch (error) {
+      this.emit("agent:error", { agentId: targetAgent.id, error });
       throw error;
     }
   }
@@ -367,6 +498,21 @@ export class Framework {
   /** 获取已注册的 Agent */
   getAgent(id: string): AgentDef | undefined {
     return this.agents.get(id);
+  }
+
+  /** 按 id 或 name 解析 Agent（id 优先），供 run/orchestrate 复用 */
+  resolveAgent(idOrName: string): AgentDef | undefined {
+    const byId = this.agents.get(idOrName);
+    if (byId) return byId;
+    for (const a of this.agents.values()) {
+      if (a.name === idOrName) return a;
+    }
+    return undefined;
+  }
+
+  /** 列出已注册 Agent 的 "name(id)" 标签，用于错误提示 */
+  private listAgentLabels(): string {
+    return [...this.agents.values()].map((a) => `${a.name}(${a.id})`).join(", ") || "无";
   }
 
   /** 获取已注册的 Tool */
@@ -503,6 +649,22 @@ export {
 } from "./runtime/agent-loop.js";
 
 export {
+  compactMessages,
+  shouldCompact,
+} from "./runtime/compaction.js";
+export type {
+  CompactionOptions,
+  CompactionResult,
+} from "./runtime/compaction.js";
+
+export {
+  loadSkills,
+  parseSkillMarkdown,
+  formatSkillsForPrompt,
+} from "./runtime/skills.js";
+export type { Skill } from "./runtime/skills.js";
+
+export {
   BaseOrchestrator,
   SequentialOrchestrator,
   ParallelOrchestrator,
@@ -515,6 +677,10 @@ export {
   BaseModelProvider,
   EchoModelProvider,
 } from "./provider/model/index.js";
+export { ClaudeModelProvider } from "./provider/model/claude.js";
+export { OpenAIModelProvider } from "./provider/model/openai.js";
+export type { ClaudeProviderConfig } from "./provider/model/claude.js";
+export type { OpenAIProviderConfig } from "./provider/model/openai.js";
 
 export {
   BaseChannel,
@@ -532,6 +698,14 @@ export {
   WorkspaceBase,
   createWorkspace,
 } from "./provider/workspace.js";
+export { NodeExecutionEnv } from "./provider/env.js";
+export type { ExecutionEnv, ExecResult } from "./provider/env.js";
+export {
+  createReadTool,
+  createWriteTool,
+  createBashTool,
+  createBuiltinTools,
+} from "./provider/builtin-tools.js";
 export type { WorkspaceConfig, WorkspaceType, WorkspaceStatus, CommandResult, FileResult } from "./core/types.js";
 
 // ============ MCP 模块导出 ============
@@ -589,6 +763,7 @@ export {
   pipe,
   parallel,
   toolbox,
+  agentAsTool,
 } from "./api.js";
 
 export type {
@@ -610,4 +785,5 @@ export type {
   Pipeline,
   ToolboxItemConfig,
   ToolboxResult,
+  AgentAsToolConfig,
 } from "./api.js";

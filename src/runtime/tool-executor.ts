@@ -64,15 +64,18 @@ export class ToolExecutor {
   private readonly toolMap: Map<string, ToolDef>;
   private readonly permissionEngine?: PermissionEngine;
   private readonly permissionMode: PermissionMode;
+  private readonly askHandler?: (toolName: string, input: ToolInput) => Promise<boolean>;
 
   constructor(
     tools: ToolDef[],
     permissionEngine?: PermissionEngine,
     permissionMode?: PermissionMode,
+    askHandler?: (toolName: string, input: ToolInput) => Promise<boolean>,
   ) {
     this.toolMap = new Map(tools.map((t) => [t.name, t]));
     this.permissionEngine = permissionEngine;
     this.permissionMode = permissionMode ?? PermissionMode.Default;
+    this.askHandler = askHandler;
   }
 
   /** 获取所有已注册的工具定义 */
@@ -108,10 +111,14 @@ export class ToolExecutor {
     }
 
     // 非并发安全的工具串行执行
-    for (const call of serial) {
-      // 每次执行前检查中断
+    for (let i = 0; i < serial.length; i++) {
+      const call = serial[i]!;
+      // 每次执行前检查中断：为当前及剩余所有工具补 aborted 占位结果，
+      // 保证返回列表与输入 calls 一一对应（每个 tool_call 都有响应）
       if (abortSignal?.aborted) {
-        results.push(this.createErrorResult(call, "执行被中断"));
+        for (let j = i; j < serial.length; j++) {
+          results.push(this.createErrorResult(serial[j]!, "执行被中断"));
+        }
         break;
       }
       const result = await this.executeSingle(call, context, abortSignal);
@@ -234,6 +241,17 @@ export class ToolExecutor {
       );
       if (level === PermissionLevel.Denied) {
         return `权限拒绝: 工具 "${toolDef.name}" 未被授权执行`;
+      }
+      if (level === PermissionLevel.Ask) {
+        // Ask：交给 askHandler 决定；无 handler 时安全默认为拒绝
+        if (!this.askHandler) {
+          return `权限拒绝: 工具 "${toolDef.name}" 需要确认，但未提供 askHandler`;
+        }
+        const approved = await this.askHandler(toolDef.name, input);
+        if (!approved) {
+          return `权限拒绝: 工具 "${toolDef.name}" 的执行请求被拒绝`;
+        }
+        return null;
       }
       if (level === PermissionLevel.Allowed || level === PermissionLevel.Bypass) {
         return null;

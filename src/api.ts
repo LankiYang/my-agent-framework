@@ -26,10 +26,15 @@ import type {
   OrchestratorResult,
 } from "./core/types.js";
 import { Framework } from "./index.js";
+import type { AgentLoopEvent, AgentLoopTerminal } from "./runtime/agent-loop.js";
 import { HookPoint, type MiddlewareFn, HookRegistry } from "./runtime/middleware.js";
 import { PermissionMode } from "./runtime/permission.js";
 import { Toolkit } from "./runtime/tool-group.js";
 import { CLIChannel } from "./provider/channel/cli-channel.js";
+import { ClaudeModelProvider } from "./provider/model/claude.js";
+import { OpenAIModelProvider } from "./provider/model/openai.js";
+import type { ExecutionEnv } from "./provider/env.js";
+import { formatSkillsForPrompt, type Skill } from "./runtime/skills.js";
 
 // ============================================================
 // 1. createTool — 极简工具定义
@@ -130,8 +135,12 @@ export interface AgentConfig {
   tools?: ToolDef[];
   /** 最大对话轮次 */
   maxTurns?: number;
-  /** 中间件列表 */
-  middleware?: Array<{ name: string; fn: MiddlewareFn }>;
+  /** 上下文压缩预算（token）。设置后启用 compaction，Agent 可长时间运行不撑爆上下文 */
+  contextBudget?: number;
+  /** 技能列表：其 name+description+指令会注入 system prompt，指导模型何时如何做某类任务 */
+  skills?: Skill[];
+  /** 中间件列表（可选 hookPoint，缺省挂到 onReply） */
+  middleware?: Array<{ name: string; fn: MiddlewareFn; hookPoint?: HookPoint }>;
   /** 权限模式 */
   permissionMode?: keyof typeof PermissionMode | PermissionMode;
 }
@@ -156,13 +165,42 @@ export function createAgent(config: AgentConfig): AgentDef {
 
   const agentId = `agent-${config.name.toLowerCase().replace(/\s+/g, "-")}-${Date.now().toString(36)}`;
 
+  let permissionMode: PermissionMode | undefined;
+  if (config.permissionMode !== undefined) {
+    const raw = config.permissionMode as string;
+    // 同时接受枚举 key（"Bypass"）与枚举值（"bypass"）
+    const byKey = (PermissionMode as Record<string, string>)[raw];
+    const values = Object.values(PermissionMode) as string[];
+    if (byKey && values.includes(byKey)) {
+      permissionMode = byKey as PermissionMode;
+    } else if (values.includes(raw)) {
+      permissionMode = raw as PermissionMode;
+    } else {
+      throw new Error(
+        `createAgent("${config.name}"): 无效的 permissionMode "${raw}"。` +
+          `可选值: [${values.join(", ")}] 或对应枚举键 [${Object.keys(PermissionMode).join(", ")}]。`,
+      );
+    }
+  }
+
+  // 把技能指导追加到系统提示词
+  const basePrompt = config.prompt ?? "";
+  const skillsBlock = config.skills && config.skills.length > 0
+    ? formatSkillsForPrompt(config.skills)
+    : "";
+  const systemPrompt = skillsBlock ? `${basePrompt}\n\n${skillsBlock}` : basePrompt;
+
   return {
     id: agentId,
     name: config.name,
     model: modelId,
-    systemPrompt: config.prompt ?? "",
+    modelProvider: typeof config.model === "string" ? undefined : config.model,
+    systemPrompt,
     tools: config.tools ?? [],
     maxTurns: config.maxTurns,
+    contextBudget: config.contextBudget,
+    permissionMode,
+    middleware: config.middleware,
   };
 }
 
@@ -182,6 +220,8 @@ export interface AppConfig {
   workspace?: WorkspaceConfig;
   /** 存储配置 */
   storage?: "memory" | "file" | StorageProvider;
+  /** 执行环境（ExecutionEnv）。内置 read/write/bash 工具经它访问系统；缺省用 NodeExecutionEnv */
+  env?: ExecutionEnv;
 }
 
 /** 监听配置 */
@@ -210,8 +250,10 @@ export interface OrchestrateConfig {
 export interface App {
   /** 内部 Framework 实例 */
   framework: Framework;
-  /** 运行单次对话 */
-  chat(input: string): Promise<AgentResult>;
+  /** 运行单次对话；可选 options.agent 指定运行哪个 Agent（id 或 name） */
+  chat(input: string, options?: { agent?: string }): Promise<AgentResult>;
+  /** 流式运行单次对话：yield agentLoop 事件（内容增量、工具执行等），实时进度 */
+  chatStream(input: string, options?: { agent?: string }): AsyncGenerator<AgentLoopEvent, AgentLoopTerminal>;
   /** 监听渠道 */
   listen(config: ListenConfig): Promise<void>;
   /** 编排多 Agent */
@@ -235,6 +277,22 @@ export function createApp(config: AppConfig): App {
   // 注册默认模型
   if (config.model) {
     framework.useModel(config.model);
+  }
+
+  // 注册执行环境（内置工具会用）
+  if (config.env) {
+    framework.useEnv(config.env);
+  }
+
+  // 自动收集各 Agent 携带的 modelProvider 实例并注册（去重），
+  // 使 createAgent({ model: providerInstance }) 无需再手动 useModel。
+  if (config.agents) {
+    for (const agent of config.agents) {
+      const mp = agent.modelProvider;
+      if (mp && !framework.getModel(mp.id)) {
+        framework.useModel(mp);
+      }
+    }
   }
 
   // 注册全局工具
@@ -269,11 +327,18 @@ export function createApp(config: AppConfig): App {
   const app: App = {
     framework,
 
-    async chat(input: string): Promise<AgentResult> {
+    async chat(input: string, options?: { agent?: string }): Promise<AgentResult> {
       if (!framework.isRunning) {
         await framework.start();
       }
-      return framework.run(input);
+      return framework.run(input, options?.agent ? { agent: options.agent } : undefined);
+    },
+
+    async *chatStream(input: string, options?: { agent?: string }) {
+      if (!framework.isRunning) {
+        await framework.start();
+      }
+      return yield* framework.runStream(input, options?.agent ? { agent: options.agent } : undefined);
     },
 
     async listen(_config: ListenConfig): Promise<void> {
@@ -289,14 +354,22 @@ export function createApp(config: AppConfig): App {
         await framework.start();
       }
 
-      // 查找参与编排的 Agent
+      // 查找参与编排的 Agent（按 id 或 name，与 framework.run 一致）
       const agents: AgentDef[] = [];
-      for (const name of orchestrateConfig.agents) {
-        // 按名称或 ID 查找
-        const agent = framework.getAgent(name);
+      const missing: string[] = [];
+      for (const key of orchestrateConfig.agents) {
+        const agent = framework.resolveAgent(key);
         if (agent) {
           agents.push(agent);
+        } else {
+          missing.push(key);
         }
+      }
+      if (missing.length > 0) {
+        throw new Error(
+          `orchestrate 未找到 Agent: [${missing.join(", ")}]。` +
+            `（agents 接受 id 或 name）`,
+        );
       }
 
       if (agents.length === 0) {
@@ -313,6 +386,11 @@ export function createApp(config: AppConfig): App {
           strategy: orchestrateConfig.strategy as unknown as import("./core/types.js").OrchestratorStrategy,
         },
       });
+
+      // 注入真实执行器：用 app 自身的 framework 驱动 agentLoop（agents 已注册其中）
+      orchestrator.setAgentExecutor((agent, agentInput) =>
+        framework.run(agentInput, { agent: agent.id }),
+      );
 
       return orchestrator.run({
         input: orchestrateConfig.input,
@@ -520,35 +598,19 @@ export function createModel(
   switch (type) {
     case "claude": {
       const claudeConfig = config as ClaudeModelConfig;
-      const modelName = claudeConfig.model ?? "claude-sonnet-4-20250514";
-      return {
-        id: `claude-${modelName}`,
-        async *generate(
-          _messages: Message[],
-          _tools: ToolDef[],
-          _systemPrompt: string,
-        ): AsyncGenerator<StreamEvent, void, unknown> {
-          // Claude API 集成占位 — 实际项目中接入 Anthropic SDK
-          yield { type: "content_delta", delta: `[Claude ${modelName}] 响应占位` };
-          yield { type: "end_turn", stopReason: "end_turn" };
-        },
-      };
+      return new ClaudeModelProvider({
+        apiKey: claudeConfig.apiKey,
+        model: claudeConfig.model,
+        baseURL: claudeConfig.baseURL,
+      });
     }
     case "openai": {
       const openaiConfig = config as OpenAIModelConfig;
-      const modelName = openaiConfig.model ?? "gpt-4o";
-      return {
-        id: `openai-${modelName}`,
-        async *generate(
-          _messages: Message[],
-          _tools: ToolDef[],
-          _systemPrompt: string,
-        ): AsyncGenerator<StreamEvent, void, unknown> {
-          // OpenAI API 集成占位 — 实际项目中接入 OpenAI SDK
-          yield { type: "content_delta", delta: `[OpenAI ${modelName}] 响应占位` };
-          yield { type: "end_turn", stopReason: "end_turn" };
-        },
-      };
+      return new OpenAIModelProvider({
+        apiKey: openaiConfig.apiKey,
+        model: openaiConfig.model,
+        baseURL: openaiConfig.baseURL,
+      });
     }
     case "custom": {
       const customConfig = config as CustomModelConfig;
@@ -572,6 +634,72 @@ export interface Pipeline {
   strategy: "sequential" | "parallel";
   /** 执行编排 */
   run(input: string, context?: Record<string, unknown>): Promise<OrchestratorResult>;
+  /**
+   * 把整条编排包装成一个 AgentDef，使其可作为单元嵌套进另一条编排。
+   * 解锁 pipe(coder, parallel(a, b).asAgent(), reviewer) 这类组合。
+   * @param name 嵌套单元的显示名（默认按策略生成）
+   */
+  asAgent(name?: string): AgentDef;
+}
+
+/**
+ * 把一条 Pipeline 包装成 AgentDef：其内部模型即"运行这条 pipeline"。
+ * 外层编排像调用普通 Agent 一样调用它，实现任意层级嵌套。
+ */
+function makePipelineAgent(pipeline: Pipeline, name: string): AgentDef {
+  const id = `nested-${pipeline.strategy}-${name.toLowerCase().replace(/\s+/g, "-")}`;
+  const provider: ModelProvider = {
+    id: `nested-provider-${id}`,
+    async *generate(messages) {
+      // 取最后一条 user 消息作为 pipeline 输入
+      const lastUser = [...messages].reverse().find((m) => m.role === "user");
+      const input = lastUser?.content ?? "";
+      const result = await pipeline.run(input);
+      yield { type: "content_delta", delta: result.output };
+      yield { type: "end_turn", stopReason: "end_turn" };
+    },
+  };
+  return {
+    id,
+    name,
+    model: provider.id,
+    modelProvider: provider, // 让 buildFrameworkExecutor 能自动注册
+    systemPrompt: "",
+    tools: [],
+    maxTurns: 1,
+  };
+}
+
+/**
+ * 用一个临时 Framework 承载 agents，返回可注入编排器的 AgentExecutor。
+ * 负责注册每个 Agent 的 modelProvider（去重）与 Agent 本身，
+ * 并以 framework.run(input, { agent }) 真正驱动 agentLoop。
+ */
+async function buildFrameworkExecutor(agents: AgentDef[]): Promise<{
+  executor: (agent: AgentDef, input: string) => Promise<AgentResult>;
+  framework: Framework;
+}> {
+  const framework = new Framework();
+  const registeredModels = new Set<string>();
+
+  for (const agent of agents) {
+    if (agent.modelProvider && !registeredModels.has(agent.modelProvider.id)) {
+      framework.useModel(agent.modelProvider);
+      registeredModels.add(agent.modelProvider.id);
+    }
+    if (!framework.getAgent(agent.id)) {
+      framework.useAgent(agent);
+    }
+  }
+
+  if (!framework.isRunning) {
+    await framework.start();
+  }
+
+  const executor = (agent: AgentDef, input: string): Promise<AgentResult> =>
+    framework.run(input, { agent: agent.id });
+
+  return { executor, framework };
 }
 
 /**
@@ -583,7 +711,7 @@ export interface Pipeline {
  * const result = await pipeline.run('写一个排序算法')
  */
 export function pipe(...agents: AgentDef[]): Pipeline {
-  return {
+  const self: Pipeline = {
     agents,
     strategy: "sequential",
     async run(input: string, context?: Record<string, unknown>): Promise<OrchestratorResult> {
@@ -595,9 +723,19 @@ export function pipe(...agents: AgentDef[]): Pipeline {
           strategy: "sequential" as unknown as import("./core/types.js").OrchestratorStrategy,
         },
       });
-      return orchestrator.run({ input, context });
+      const { executor, framework } = await buildFrameworkExecutor(agents);
+      orchestrator.setAgentExecutor((agent, agentInput) => executor(agent, agentInput));
+      try {
+        return await orchestrator.run({ input, context });
+      } finally {
+        await framework.stop(); // 清理内部临时 Framework，避免资源泄漏
+      }
+    },
+    asAgent(name?: string): AgentDef {
+      return makePipelineAgent(self, name ?? "SequentialPipeline");
     },
   };
+  return self;
 }
 
 /**
@@ -609,7 +747,7 @@ export function pipe(...agents: AgentDef[]): Pipeline {
  * const result = await analysis.run('分析这段代码')
  */
 export function parallel(...agents: AgentDef[]): Pipeline {
-  return {
+  const self: Pipeline = {
     agents,
     strategy: "parallel",
     async run(input: string, context?: Record<string, unknown>): Promise<OrchestratorResult> {
@@ -621,7 +759,98 @@ export function parallel(...agents: AgentDef[]): Pipeline {
           strategy: "parallel" as unknown as import("./core/types.js").OrchestratorStrategy,
         },
       });
-      return orchestrator.run({ input, context });
+      const { executor, framework } = await buildFrameworkExecutor(agents);
+      orchestrator.setAgentExecutor((agent, agentInput) => executor(agent, agentInput));
+      try {
+        return await orchestrator.run({ input, context });
+      } finally {
+        await framework.stop(); // 清理内部临时 Framework，避免资源泄漏
+      }
+    },
+    asAgent(name?: string): AgentDef {
+      return makePipelineAgent(self, name ?? "ParallelPipeline");
+    },
+  };
+  return self;
+}
+
+// ============================================================
+// 8b. agentAsTool — 把一个 Agent 包装成工具（Agent 组合 / 层级）
+// ============================================================
+
+/** agentAsTool 配置 */
+export interface AgentAsToolConfig {
+  /** 暴露给上层 Agent 的工具名（默认 ask_<agent-slug>） */
+  name?: string;
+  /** 工具描述（建议自定义以帮助上层模型决策） */
+  description?: string;
+  /**
+   * 复用的 Framework 实例。不传时内部自建一个（并在每次调用后清理）。
+   * 传入可复用同一运行时（推荐在编排/多次调用场景）。
+   */
+  framework?: Framework;
+  /** 从工具输入里取哪个字段作为子 Agent 的输入文本（默认 "input"） */
+  inputKey?: string;
+}
+
+/**
+ * 把一个 Agent 包装成 ToolDef，使它能作为另一个 Agent 的工具被调用。
+ * 解锁 supervisor-as-tool、递归分解、层级多 Agent 等组合模式。
+ *
+ * @example
+ * const researcher = createAgent({ name: 'Researcher', model: claude, tools: [webSearch] });
+ * const writer = createAgent({
+ *   name: 'Writer',
+ *   model: claude,
+ *   tools: [agentAsTool(researcher, { description: '就某主题做资料调研，返回要点' })],
+ * });
+ */
+export function agentAsTool(agent: AgentDef, config: AgentAsToolConfig = {}): ToolDef {
+  const toolName = config.name ?? `ask_${agent.name.toLowerCase().replace(/\s+/g, "_")}`;
+  const inputKey = config.inputKey ?? "input";
+
+  return {
+    name: toolName,
+    description:
+      config.description ??
+      `把任务委派给「${agent.name}」子 Agent 处理，返回它的最终输出。`,
+    inputSchema: {
+      type: "object",
+      properties: {
+        [inputKey]: { type: "string", description: `交给「${agent.name}」处理的任务描述` },
+      },
+      required: [inputKey],
+    },
+    isReadOnly: false,
+    isConcurrencySafe: true,
+    execute: async (input) => {
+      const task = String(input[inputKey] ?? "");
+
+      // 复用传入的 framework；否则自建并在结束后清理，避免资源泄漏
+      const external = config.framework;
+      const framework = external ?? new Framework();
+
+      // 确保子 Agent 的模型与定义已注册
+      if (agent.modelProvider && !framework.getModel(agent.modelProvider.id)) {
+        framework.useModel(agent.modelProvider);
+      }
+      if (!framework.getAgent(agent.id)) {
+        framework.useAgent(agent);
+      }
+      // 无论复用还是自建，都必须已启动才能 run
+      if (!framework.isRunning) {
+        await framework.start();
+      }
+
+      try {
+        const result = await framework.run(task, { agent: agent.id });
+        return { content: result.output };
+      } finally {
+        // 只清理自建的 framework；外部传入的由调用方负责生命周期
+        if (!external) {
+          await framework.stop();
+        }
+      }
     },
   };
 }

@@ -24,6 +24,7 @@ import { ContextManager, CHARS_PER_TOKEN } from "./context-manager.js";
 import { HookRegistry, HookPoint } from "./middleware.js";
 import type { MiddlewareContext } from "./middleware.js";
 import { PermissionEngine, PermissionMode } from "./permission.js";
+import { compactMessages } from "./compaction.js";
 
 // ============================================================
 // Terminal 状态 — 10 种终止原因
@@ -116,8 +117,27 @@ export interface AgentLoopOptions {
   permissionEngine?: PermissionEngine;
   /** 权限模式（可选，默认 PermissionMode.Default） */
   permissionMode?: PermissionMode;
+  /**
+   * 权限询问处理器：工具权限判定为 Ask 时调用，返回 true 放行、false 拒绝。
+   * 未提供时 Ask 默认按拒绝处理（安全默认）。
+   */
+  askHandler?: (toolName: string, input: Record<string, unknown>) => Promise<boolean>;
   /** 恢复重试退避延迟（毫秒，默认 1000） */
   recoveryBackoffMs?: number;
+  /**
+   * 上下文压缩配置。提供后，每轮开始前若历史逼近预算，
+   * 自动把早期历史摘要压缩（而非直接删除），让 Agent 能长时间运行。
+   */
+  compaction?: {
+    /** token 预算（按字符估算） */
+    budget: number;
+    /** 预留 token（系统提示+输出），默认 budget/8 */
+    reserveTokens?: number;
+    /** 保留的最近消息 token 数，默认 budget/4 */
+    keepRecentTokens?: number;
+  };
+  /** 执行环境，注入到工具的 SharedContext.env（内置 read/write/bash 工具会用） */
+  env?: unknown;
 }
 
 // ============================================================
@@ -180,8 +200,8 @@ function delay(ms: number): Promise<void> {
  * 当用户未注入某项依赖时，使用框架内置的 ToolExecutor / ContextManager / HookRegistry
  */
 function buildDefaultDeps(options: AgentLoopOptions): AgentLoopDeps {
-  const { model, tools, hooks, permissionEngine, permissionMode } = options;
-  const toolExecutor = new ToolExecutor(tools, permissionEngine, permissionMode);
+  const { model, tools, hooks, permissionEngine, permissionMode, askHandler } = options;
+  const toolExecutor = new ToolExecutor(tools, permissionEngine, permissionMode, askHandler);
   const contextManager = new ContextManager();
   const hookRegistry = hooks ?? new HookRegistry();
 
@@ -272,6 +292,7 @@ export async function* agentLoop(
   options: AgentLoopOptions,
 ): AsyncGenerator<AgentLoopEvent, AgentLoopTerminal> {
   const {
+    model,
     tools,
     systemPrompt,
     maxTurns = DEFAULT_MAX_TURNS,
@@ -279,6 +300,8 @@ export async function* agentLoop(
     tokenBudget,
     maxOutputRecoveryLimit = DEFAULT_MAX_OUTPUT_RECOVERY_LIMIT,
     recoveryBackoffMs = DEFAULT_RECOVERY_BACKOFF_MS,
+    compaction,
+    env,
   } = options;
 
   // 解析依赖
@@ -309,18 +332,20 @@ export async function* agentLoop(
     }
 
     // ----------------------------------------------------------
-    // 2. 轮次计数 + 检查最大轮次
+    // 2. 检查最大轮次 + 轮次计数
+    //    turnCount 语义：已开始的轮数。先判断再自增，使 maxTurns=N
+    //    恰好执行 N 轮，且返回的 turnCount 与实际完成轮数一致。
     // ----------------------------------------------------------
-    state.turnCount++;
-    if (state.turnCount > maxTurns) {
-      yield { type: "turn_end", reason: "max_turns", turn: state.turnCount - 1 };
+    if (state.turnCount >= maxTurns) {
+      yield { type: "turn_end", reason: "max_turns", turn: state.turnCount };
       return {
         reason: "max_turns",
-        turnCount: state.turnCount - 1,
+        turnCount: state.turnCount,
         messages: state.messages,
         transition: state.transition,
       };
     }
+    state.turnCount++;
 
     // ----------------------------------------------------------
     // 3. 如果是恢复续传，产出 recovery 事件
@@ -339,6 +364,27 @@ export async function* agentLoop(
     // 4. 产出 turn_start 事件
     // ----------------------------------------------------------
     yield { type: "turn_start", turn: state.turnCount };
+
+    // ----------------------------------------------------------
+    // 4b. 上下文压缩（compaction）：历史逼近预算时，把早期历史摘要压缩，
+    //     而非直接删除，让 Agent 能长时间运行不撑爆上下文。
+    // ----------------------------------------------------------
+    if (compaction) {
+      const result = await compactMessages(state.messages, {
+        budget: compaction.budget,
+        reserveTokens: compaction.reserveTokens,
+        keepRecentTokens: compaction.keepRecentTokens,
+        model,
+      });
+      if (result.compacted) {
+        yield {
+          type: "compact",
+          tokensBefore: result.tokensBefore ?? 0,
+          tokensAfter: result.tokensAfter ?? 0,
+        };
+        state = { ...state, messages: result.messages };
+      }
+    }
 
     // ----------------------------------------------------------
     // 5. 消息预处理管道
@@ -387,8 +433,21 @@ export async function* agentLoop(
     let stopReason = "";
     let modelError: Error | undefined;
 
+    // 6a. onSystemPrompt / onModelCall hook（调用模型前）
+    //     允许中间件在发送前改写 systemPrompt 或 messages。
+    let effectiveSystemPrompt = systemPrompt;
+    {
+      const preCtx = createHookContext(messagesForModel, effectiveSystemPrompt, tools, `agent_loop_${state.turnCount}`);
+      const spResult = await deps.applyHooks(HookPoint.onSystemPrompt, preCtx);
+      effectiveSystemPrompt = spResult.systemPrompt;
+      messagesForModel = spResult.messages;
+      const mcResult = await deps.applyHooks(HookPoint.onModelCall, preCtx);
+      effectiveSystemPrompt = mcResult.systemPrompt;
+      messagesForModel = mcResult.messages;
+    }
+
     try {
-      const stream = deps.callModel(messagesForModel, tools, systemPrompt);
+      const stream = deps.callModel(messagesForModel, tools, effectiveSystemPrompt);
 
       for await (const event of stream) {
         // 流式阶段中断检查
@@ -593,10 +652,25 @@ export async function* agentLoop(
       messages: state.messages,
       artifacts: {},
       metadata: {},
+      env,
     };
+
+    // 10c-hook. onActing hook（工具执行前）
+    {
+      const actCtx = createHookContext(state.messages, systemPrompt, tools, `agent_loop_${state.turnCount}`);
+      (actCtx as Record<string, unknown>)["pendingToolCalls"] = pendingToolCalls;
+      await deps.applyHooks(HookPoint.onActing, actCtx);
+    }
 
     // 10d. 执行工具
     const toolResults = await deps.executeTools(pendingToolCalls, sharedContext, abortSignal);
+
+    // 10d-hook. onActing hook（工具执行后，可观察结果）
+    {
+      const actCtx = createHookContext(state.messages, systemPrompt, tools, `agent_loop_${state.turnCount}`);
+      (actCtx as Record<string, unknown>)["toolResults"] = toolResults;
+      await deps.applyHooks(HookPoint.onActing, actCtx);
+    }
 
     // 10e. 执行后检查中断
     if (abortSignal?.aborted) {
@@ -625,7 +699,7 @@ export async function* agentLoop(
       (r) => r.content.includes("权限拒绝"),
     );
     if (allPermissionDenied) {
-      const finalMsgs = [...state.messages, assistantMessage, ...toolResults];
+      const finalMsgs = [...state.messages, assistantMessage, ...pendingToolCalls, ...toolResults];
       yield { type: "turn_end", reason: "permission_denied", turn: state.turnCount };
       return {
         reason: "permission_denied",
@@ -637,9 +711,13 @@ export async function* agentLoop(
 
     // ----------------------------------------------------------
     // 11. 组装下一轮消息 — Continue Site: next_turn
+    //
+    // 历史里显式保留独立的 tool_call 消息（pendingToolCalls），
+    // 使真实 provider 能还原 assistant 的工具调用序列，
+    // 而不只依赖 assistantMessage.metadata.toolCalls。
     // ----------------------------------------------------------
     state = {
-      messages: [...state.messages, assistantMessage, ...toolResults],
+      messages: [...state.messages, assistantMessage, ...pendingToolCalls, ...toolResults],
       turnCount: state.turnCount,
       maxOutputRecoveryCount: 0,
       hasAttemptedCompact: false,

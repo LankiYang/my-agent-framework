@@ -104,6 +104,11 @@ export interface AgentDef {
   name: string;
   /** 所使用的模型标识 */
   model: string;
+  /**
+   * 可选的 ModelProvider 实例引用。当通过高层 API 传入 provider 实例创建 Agent 时保留，
+   * 供编排便捷函数（pipe/parallel）自动注册模型使用。
+   */
+  modelProvider?: ModelProvider;
   /** 系统提示词 */
   systemPrompt: string;
   /** 可用工具列表 */
@@ -112,6 +117,22 @@ export interface AgentDef {
   hooks?: Partial<Record<LifecycleHookPoint, HookFn>>;
   /** 最大对话轮次限制 */
   maxTurns?: number;
+  /**
+   * 上下文压缩预算（token，按字符估算）。设置后启用 compaction：
+   * 历史逼近该预算时自动摘要早期历史，让 Agent 能长时间运行。
+   */
+  contextBudget?: number;
+  /**
+   * 权限模式（字符串，对应 runtime/permission.ts 的 PermissionMode 枚举值）。
+   * 放宽为 string 以避免 core → runtime 的循环依赖。
+   */
+  permissionMode?: string;
+  /**
+   * 中间件列表（洋葱模型），运行时会注册进 HookRegistry。
+   * fn 类型放宽为 unknown、hookPoint 为 string，以避免 core → runtime 的循环依赖。
+   * hookPoint 缺省时注册到 onReply。
+   */
+  middleware?: Array<{ name: string; fn: unknown; hookPoint?: string }>;
 }
 
 // ============================================================
@@ -227,6 +248,11 @@ export interface SharedContext {
   metadata: Record<string, unknown>;
   /** 父级 Agent 标识（用于层级结构） */
   parentAgentId?: AgentId;
+  /**
+   * 执行环境（文件系统 + shell）。内置工具经它访问系统，便于测试/沙盒。
+   * 类型为 provider/env.ts 的 ExecutionEnv（放宽为 unknown 以保持 core 无依赖）。
+   */
+  env?: unknown;
 }
 
 // ============================================================
@@ -447,12 +473,19 @@ export type RouteFunction = (input: string, agents: AgentDef[]) => Promise<Agent
 export interface FrameworkRunOptions {
   /** 指定编排器名称 */
   orchestrator?: string;
+  /** 指定要运行的 Agent（id 或 name）；未指定时使用第一个注册的 Agent */
+  agent?: string;
   /** 指定模型名称 */
   model?: string;
   /** 上下文数据 */
   context?: Record<string, unknown>;
   /** 外部中止信号 */
   abortSignal?: AbortSignal;
+  /**
+   * 权限询问处理器：当工具权限判定为 Ask 时调用，返回 true 放行、false 拒绝。
+   * 未提供时，Ask 结果默认按拒绝处理（安全默认）。
+   */
+  askHandler?: (toolName: string, input: ToolInput) => Promise<boolean>;
 }
 
 // ============================================================
