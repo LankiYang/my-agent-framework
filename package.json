@@ -64,5 +64,9 @@
     "@types/node": "^25.9.1",
     "tsx": "^4.16.0",
     "typescript": "^5.5.0"
+  },
+  "optionalDependencies": {
+    "@anthropic-ai/sdk": "^0.115.0",
+    "openai": "^6.49.0"
   }
 }
